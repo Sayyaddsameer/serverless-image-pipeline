@@ -1,0 +1,247 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Serverless image processing pipeline template'
+
+Resources:
+  # ---------------------------------------------------------
+  # SQS Queues
+  # ---------------------------------------------------------
+  DLQProcessorErrors:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: DLQProcessorErrors
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 1209600
+
+  DLQProcessedMessages:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: DLQProcessedMessages
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 1209600
+
+  ImageProcessedQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ImageProcessedQueue
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DLQProcessedMessages.Arn
+        maxReceiveCount: 5
+
+  # ---------------------------------------------------------
+  # DynamoDB Table
+  # ---------------------------------------------------------
+  ImageMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ImageMetadataTable
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: originalKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: originalKey
+          KeyType: HASH
+
+  # ---------------------------------------------------------
+  # IAM Roles
+  # ---------------------------------------------------------
+  ImageProcessorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ImageProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::input-image-bucket-dev-v1/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::processed-image-bucket-dev-v1/*'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt ImageProcessedQueue.Arn
+                  - !GetAtt DLQProcessorErrors.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+
+  MetadataUpdaterLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MetadataUpdaterPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt ImageProcessedQueue.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt ImageMetadataTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+
+  # ---------------------------------------------------------
+  # Lambda Functions
+  # ---------------------------------------------------------
+  ImageProcessorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ImageProcessorLambda
+      Runtime: python3.12
+      Handler: app.handler
+      Timeout: 60
+      MemorySize: 512
+      Role: !GetAtt ImageProcessorLambdaRole.Arn
+      Code:
+        ZipFile: |
+          # Deployed via CI/CD pipeline or packaging script
+          def handler(event, context):
+              pass
+      Environment:
+        Variables:
+          TARGET_WIDTH: '200'
+          WATERMARK_TEXT: '(c) MyCompany'
+          SQS_QUEUE_URL: !Ref ImageProcessedQueue
+          DLQ_QUEUE_URL: !Ref DLQProcessorErrors
+          PROCESSED_BUCKET_NAME: !Ref ProcessedImageBucket
+
+  MetadataUpdaterLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: MetadataUpdaterLambda
+      Runtime: python3.12
+      Handler: app.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt MetadataUpdaterLambdaRole.Arn
+      Code:
+        ZipFile: |
+          # Deployed via CI/CD pipeline or packaging script
+          def handler(event, context):
+              pass
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref ImageMetadataTable
+
+  # ---------------------------------------------------------
+  # Lambda Permission
+  # ---------------------------------------------------------
+  ImageProcessorLambdaS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ImageProcessorLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::input-image-bucket-dev-v1'
+
+  # ---------------------------------------------------------
+  # S3 Buckets
+  # ---------------------------------------------------------
+  InputImageBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: ImageProcessorLambdaS3Permission
+    Properties:
+      BucketName: input-image-bucket-dev-v1
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ImageProcessorLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .jpg
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ImageProcessorLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .jpeg
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ImageProcessorLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .png
+
+  ProcessedImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: processed-image-bucket-dev-v1
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ---------------------------------------------------------
+  # Event Source Mapping
+  # ---------------------------------------------------------
+  MetadataUpdaterEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ImageProcessedQueue.Arn
+      FunctionName: !Ref MetadataUpdaterLambda
+      BatchSize: 10
+      Enabled: true
+
+Outputs:
+  InputBucketName:
+    Value: !Ref InputImageBucket
+  ProcessedBucketName:
+    Value: !Ref ProcessedImageBucket
+  ImageProcessedQueueUrl:
+    Value: !Ref ImageProcessedQueue
+  DLQProcessorErrorsUrl:
+    Value: !Ref DLQProcessorErrors
+  DLQProcessedMessagesUrl:
+    Value: !Ref DLQProcessedMessages
+  ImageMetadataTableName:
+    Value: !Ref ImageMetadataTable
+  ImageProcessorLambdaArn:
+    Value: !GetAtt ImageProcessorLambda.Arn
+  MetadataUpdaterLambdaArn:
+    Value: !GetAtt MetadataUpdaterLambda.Arn
